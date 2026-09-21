@@ -8,15 +8,42 @@
 
 ## 它能帮你做什么
 
-装上 `dsh-notion-mcp` 后，你的 `dsh` agent 即可直接读写 Notion。你只需要在浏览器里完成一次授权，剩下的事插件都会自动打理：跑完整套 OAuth 2.0（授权码 + PKCE）流程、把 token 安全保存到 dsh 的凭据层、在后台静默刷新保持有效，并把 Notion 的搜索、页面、数据库、评论等工具以 `mcp__notion__*` 的形式挂载给 agent。
+装上 `dsh-notion-mcp` 后，你的 `dsh` agent 即可直接读写 Notion。你只需要在浏览器里完成一次授权，之后**在需要的那条对话里用 `/notion` 按需连接**：插件会跑完整套 OAuth 2.0（授权码 + PKCE）流程、把 token 安全保存到 dsh 的凭据层、在会话存续期间静默刷新保持有效，并把 Notion 的搜索、页面、数据库、评论等工具以 `mcp__notion__*` 的形式挂载给 agent。
+
+## 与「常驻挂载」的区别
+
+工具**不会**在每个对话里自动出现。只有执行过 `/notion` 的对话才会挂载 Notion 工具，且挂载范围限定在该会话自己的作用域内：
+
+- 新建的对话、以及从未用过 `/notion` 的对话，**完全看不到** `mcp__notion__*` 工具，也就不会被它们的描述占用上下文。
+- 挂载随会话作用域回收：会话结束（或 agent 被销毁）时连接与工具一并卸载。
+- 这样按需连接可以彻底避免「装了就每轮都被注入」的长期开销。
 
 ## 特性
 
+- **按需挂载** —— 只有执行过 `/notion` 的会话才连接 Notion；其余对话零工具注入。
+- **会话级隔离** —— 工具挂在 agent 自己的作用域，不会泄漏到其它对话。
 - **零配置 OAuth** —— 动态客户端注册（RFC 7591）在运行时注册客户端，无需复制任何 `client_id` 或密钥。
 - **一次性浏览器登录** —— `dsh notion login` 打印授权 URL，并在 `127.0.0.1:53007` 等待回调。
-- **静默刷新 token** —— access token（约 8 小时）到期前自动刷新；轮换后的 refresh token 原子落盘。
+- **静默刷新 token** —— access token（约 8 小时）到期前自动刷新并重建连接；轮换后的 refresh token 原子落盘。
 - **`invalid_grant` 终态处理** —— 过期或已被轮换作废的 refresh token 绝不重试；插件会清掉它并提示你重新授权。
 - **仓库不含任何密钥** —— token 存在 dsh 的凭据存储里，不进入本仓库。
+
+## 用法
+
+在任意对话里：
+
+```text
+/notion 看一下 Notion 里的《XX 架构设计》文档，总结一下重点
+```
+
+插件会先把 Notion 工具挂到当前会话，**等工具真正就绪后**再把「看一下…」这条任务交给模型，因此模型在同一轮就能用上 `mcp__notion__*`。
+
+```text
+/notion          # 只连接，不派发任务（之后可以直接继续对话）
+```
+
+首轮任务派发前会等待 MCP 连接与工具注册完成，避免「请求先发出去、工具还没挂上」的竞态。
+
 
 ## 截图
 
@@ -39,10 +66,18 @@ dsh notion login
 浏览器批准 → 回调到 127.0.0.1:53007
    │  4. 用 code（加 PKCE verifier）换取 token
    ▼
-token 落盘 → Notion MCP 挂载为 mcp__notion__*
+token 落盘（此后不再自动连接）
+   ⋯
+在某条对话里执行 /notion <任务>
+   │  5. 读取并（必要时）刷新 token
+   │  6. 在该 agent 的作用域下挂载 MCP，等待工具注册完成
+   │  7. 把任务作为一轮新输入交给模型
+   ▼
+Notion 工具以 mcp__notion__* 仅对该会话可用，随会话回收
 ```
 
-启动时插件会读取已存 token 并挂载 MCP 客户端；临近过期时在后台刷新（串行化，避免并发重放已轮换的 refresh token）。
+`dsh notion login` 只负责完成授权并落盘 token，**不会**顺带挂载连接。真正的连接发生在某条对话执行 `/notion` 时，且挂在该 agent 自己的作用域（`agent.ctx`）下——这正是工具不会泄漏到其它对话的原因。临近过期时在会话内静默刷新，串行化以避免并发重放已轮换的 refresh token。
+
 
 ## 安装
 
@@ -61,9 +96,9 @@ dsh plugin --profile notion add dsh-notion-mcp
 dsh --profile notion notion login
 ```
 
-该命令会注册一个动态 OAuth 客户端，在 `127.0.0.1:53007` 起一个临时本地 HTTP 服务，并打印授权 URL。在浏览器里打开并批准后，Notion 会重定向到 `http://127.0.0.1:53007/callback`，插件校验 `state`、用 code（加 PKCE verifier）换取 token、落盘并挂载客户端。
+该命令会注册一个动态 OAuth 客户端，在 `127.0.0.1:53007` 起一个临时本地 HTTP 服务，并打印授权 URL。在浏览器里打开并批准后，Notion 会重定向到 `http://127.0.0.1:53007/callback`，插件校验 `state`、用 code（加 PKCE verifier）换取 token 并落盘。
 
-授权完成后，Notion 工具即以 `mcp__notion__*` 形式可用。
+授权完成后**不会立刻挂载**。去任意对话里执行 `/notion`（或 `/notion <任务>`），Notion 工具才会以 `mcp__notion__*` 形式对该会话可用。
 
 ## 卸载
 

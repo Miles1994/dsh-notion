@@ -32,8 +32,11 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
     "@deepseek-ai/dsh-cmdline": "*",
+    "@deepseek-ai/dsh-commands": "*",
     "@deepseek-ai/dsh-credentials": "*",
+    "@deepseek-ai/dsh-llm": "*",
     "@deepseek-ai/dsh-mcp-client": "*",
     "@deepseek-ai/schemastery": "*"
   },

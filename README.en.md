@@ -8,15 +8,42 @@ Connect [DeepSeek Harness](https://github.com/deepseek-ai/dsh) (`dsh`) to [Notio
 
 ## What it does for you
 
-Once installed, your `dsh` agent can read and write Notion directly. You authorize once in your browser, and the plugin takes care of everything after that: it runs the full OAuth 2.0 (authorization code + PKCE) flow, stores the tokens securely in dsh's credential seam, refreshes them silently in the background, and mounts Notion's search, page, database, and comment tools under `mcp__notion__*`.
+Once installed, your `dsh` agent can read and write Notion directly. You authorize once in your browser, then **connect on demand with `/notion` in the conversations that need it**: the plugin runs the full OAuth 2.0 (authorization code + PKCE) flow, stores the tokens securely in dsh's credential seam, keeps them refreshed for the life of the session, and mounts Notion's search, page, database, and comment tools under `mcp__notion__*`.
+
+## How this differs from an always-on mount
+
+The tools do **not** appear in every conversation. Only a conversation that has run `/notion` mounts them, and the mount is scoped to that conversation's own agent scope:
+
+- A new conversation — or any conversation that never ran `/notion` — sees **no** `mcp__notion__*` tools at all, so their descriptions never consume context there.
+- The mount is reclaimed with the agent scope: when the conversation ends (or the agent is disposed) the connection and its tools go away with it.
+- Connecting on demand removes the standing cost of "install once, pay the tool-definition tokens in every turn forever".
 
 ## Features
 
+- **On-demand mounting** — only conversations that ran `/notion` connect to Notion; every other conversation has zero tool injection.
+- **Per-conversation isolation** — tools live in the agent's own scope and never leak into other conversations.
 - **Zero-config OAuth** — dynamic client registration (RFC 7591) registers a client at runtime; no `client_id` or secret to copy.
 - **One-time browser login** — `dsh notion login` prints an authorization URL and waits for the callback on `127.0.0.1:53007`.
-- **Silent token refresh** — access tokens (~8 h) refresh automatically before expiry; the rotated refresh token is persisted atomically.
+- **Silent token refresh** — access tokens (~8 h) refresh automatically before expiry and the live connection is rebuilt with the new token; the rotated refresh token is persisted atomically.
 - **Terminal `invalid_grant` handling** — an expired or rotated-away refresh token is never retried; the plugin clears it and asks you to re-authorize.
 - **No secrets in the repo** — tokens live in dsh's credential store, not in this repository.
+
+## Usage
+
+In any conversation:
+
+```text
+/notion Summarize the "Architecture Design" doc in Notion
+```
+
+The plugin first mounts the Notion tools for the current conversation, **waits until they are actually registered**, and only then hands the task to the model — so the model can use `mcp__notion__*` in that very turn.
+
+```text
+/notion         # connect only, dispatch no task (keep chatting afterwards)
+```
+
+The first task waits for the MCP connection and tool registration to settle, avoiding the race where the request is sent before the tools exist.
+
 
 ## Screenshots
 
@@ -39,10 +66,17 @@ dsh notion login
 browser approves → callback on 127.0.0.1:53007
    │  4. Exchange code (plus PKCE verifier) for tokens
    ▼
-tokens persisted → Notion MCP mounted as mcp__notion__*
+tokens persisted (no automatic mount from here on)
+   ⋯
+/notion <task> in some conversation
+   │  5. Load the token, refreshing it if near expiry
+   │  6. Mount the MCP client under that agent's scope and await registration
+   │  7. Deliver the task as a fresh turn for the model
+   ▼
+Notion tools available as mcp__notion__* for that conversation only
 ```
 
-On startup the plugin loads the stored tokens and mounts the MCP client; as they near expiry it refreshes them in the background (serialized, so a rotated refresh token is never replayed concurrently).
+`dsh notion login` only authorizes and persists the token — it does **not** mount a connection. The connection happens when a conversation runs `/notion`, mounted under that agent's own scope (`agent.ctx`), which is exactly why the tools never leak into other conversations. Near expiry the token is refreshed silently inside the session, serialized so a rotated refresh token is never replayed concurrently.
 
 ## Install
 
@@ -61,9 +95,9 @@ dsh plugin --profile notion add dsh-notion-mcp
 dsh --profile notion notion login
 ```
 
-The command registers a dynamic OAuth client, starts a temporary local HTTP server on `127.0.0.1:53007`, and prints an authorization URL. Open it in your browser and approve the request; Notion redirects to `http://127.0.0.1:53007/callback`, and the plugin validates the `state`, exchanges the code (plus the PKCE verifier) for tokens, stores them, and mounts the client.
+The command registers a dynamic OAuth client, starts a temporary local HTTP server on `127.0.0.1:53007`, and prints an authorization URL. Open it in your browser and approve the request; Notion redirects to `http://127.0.0.1:53007/callback`, and the plugin validates the `state`, exchanges the code (plus the PKCE verifier) for tokens, and stores them.
 
-After authorization, Notion tools are available under `mcp__notion__*`.
+Authorization does **not** mount anything immediately. Run `/notion` (or `/notion <task>`) in a conversation to make the Notion tools available under `mcp__notion__*` for that conversation.
 
 ## Uninstall
 
