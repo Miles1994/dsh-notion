@@ -3,13 +3,14 @@ import { apply, name, inject, Config } from '../src/index.js'
 
 /**
  * Minimal cordis-shaped context. The plugin touches only a small slice:
- * `credentials`, `cmdlineArgs`, `inject`, `effect`, and (for `/notion`) the
- * command registry plus the agent's own scoped `plugin`.
+ * `credentials`, `cmdlineArgs`, `inject`, `effect`, `on`, and the command and
+ * tool registries plus each agent's own scoped `plugin`.
  */
 function fakeCtx() {
   const registered: any[] = []
+  const tools: any[] = []
   const effects: Array<() => void> = []
-  const disposed: any[] = []
+  const handlers = new Map<string, Array<(...args: any[]) => any>>()
   const store = new Map<string, string>()
 
   const ctx: any = {
@@ -31,27 +32,56 @@ function fakeCtx() {
       const d = fn()
       if (typeof d === 'function') effects.push(d)
     },
+    on: (event: string, handler: (...args: any[]) => any) => {
+      const list = handlers.get(event) ?? []
+      list.push(handler)
+      handlers.set(event, list)
+    },
   }
   ctx.commands = { register: (def: any) => { registered.push(def); return () => {} } }
-  return { ctx, registered, effects, disposed, store }
+  ctx.tools = { register: (def: any) => { tools.push(def); return () => {} } }
+  /** Run every listener registered for one event; returns the last result. */
+  const emit = async (event: string, payload: any, next: () => Promise<any>) => {
+    const list = handlers.get(event) ?? []
+    let chain = next
+    for (const handler of [...list].reverse()) {
+      const downstream = chain
+      chain = () => handler(payload, downstream)
+    }
+    return chain()
+  }
+  return { ctx, registered, tools, effects, handlers, emit, store }
 }
 
 const fakeAgent = () => {
   const followed: any[] = []
   const steered: any[] = []
+  const prepended: any[] = []
+  const pluginCalls: any[] = []
   const agent: any = {
     id: 'session-1',
     followup: (m: any) => followed.push(m),
     steer: (m: any) => steered.push(m),
+    inbox: {
+      nextStep: [] as any[],
+      nextTurn: [] as any[],
+      prepend: (target: string, m: any) => prepended.push({ target, m }),
+    },
     ctx: {
-      plugin: (_p: any, _c: any) => {
+      plugin: (_p: any, c: any) => {
+        pluginCalls.push(c)
         const fiber: any = Promise.resolve({ dispose: async () => {} })
         fiber.dispose = async () => {}
         return fiber
       },
     },
   }
-  return { agent, followed, steered }
+  return { agent, followed, steered, prepended, pluginCalls }
+}
+
+/** One user-authored text message in the shape the loop claims. */
+function userMessage(id: string, text: string) {
+  return { id, content: [{ type: 'text', text }], source: { kind: 'user' } } as any
 }
 
 async function seedTokens(ctx: any, expiresAt = Date.now() + 3_600_000) {
@@ -142,7 +172,95 @@ it('mounts each conversation independently (per-agent scope)', async () => {
   expect(b.followed).toHaveLength(1)
 })
 
-it('a config with defaults resolves mcpUrl and port', () => {
+it('does not mount a second time when the agent is already connected', async () => {
+  const { ctx, registered } = fakeCtx()
+  await seedTokens(ctx)
+  apply(ctx, { mcpUrl: 'https://example.test/mcp', port: 53007 })
+  const { agent, pluginCalls } = fakeAgent()
+
+  // mcp-client rejects a duplicate serverName in one scope, so a repeat
+  // invocation must reuse the live mount instead of mounting again.
+  await registered[0].handler({ agent, rawInput: '', attachments: [] })
+  await registered[0].handler({ agent, rawInput: '', attachments: [] })
+
+  expect(pluginCalls).toHaveLength(1)
+})
+
+it('a config with defaults resolves mcpUrl, port, and the trigger switches', () => {
   expect(Config({}).mcpUrl).toBe('https://mcp.notion.com/mcp')
   expect(Config({}).port).toBe(53007)
+  expect(Config({}).autoTrigger).toBe(true)
+  expect(Config({}).connectTool).toBe(true)
+})
+
+it('registers the always-on notion_connect bootstrap tool', () => {
+  const { ctx, tools } = fakeCtx()
+  apply(ctx, { mcpUrl: 'https://example.test/mcp', port: 53007 })
+  expect(tools).toHaveLength(1)
+  expect(tools[0].name).toBe('notion_connect')
+})
+
+it('withholds the bootstrap tool when connectTool is false', () => {
+  const { ctx, tools } = fakeCtx()
+  apply(ctx, { mcpUrl: 'https://example.test/mcp', port: 53007, connectTool: false } as any)
+  expect(tools).toHaveLength(0)
+})
+
+it('keyword trigger mounts and re-queues the message instead of entering the step', async () => {
+  const { ctx, emit } = fakeCtx()
+  await seedTokens(ctx)
+  apply(ctx, { mcpUrl: 'https://example.test/mcp', port: 53007 })
+  const { agent, prepended } = fakeAgent()
+  const messages = [userMessage('m1', '看一下notion中今天的待办有哪些')]
+
+  const decision = await emit('agent/pre-step', { agent, messages, signal: { throwIfAborted() {} } },
+    async () => ({ kind: 'enter', messages }))
+
+  expect(decision.kind).toBe('reject')
+  // The claimed message must be re-queued or it would be lost entirely.
+  expect(prepended.map((p) => p.m.id)).toEqual(['m1'])
+  expect(prepended[0].target).toBe('next-step')
+})
+
+it('does not trigger on a message that merely mentions Notion', async () => {
+  const { ctx, emit } = fakeCtx()
+  await seedTokens(ctx)
+  apply(ctx, { mcpUrl: 'https://example.test/mcp', port: 53007 })
+  const { agent } = fakeAgent()
+  const messages = [userMessage('m1', 'notion 和飞书的区别是什么')]
+  let entered = false
+
+  const decision = await emit('agent/pre-step', { agent, messages, signal: { throwIfAborted() {} } },
+    async () => { entered = true; return { kind: 'enter', messages } })
+
+  expect(entered).toBe(true)
+  expect(decision.kind).toBe('enter')
+})
+
+it('skips triggering entirely when autoTrigger is false', async () => {
+  const { ctx, emit } = fakeCtx()
+  await seedTokens(ctx)
+  apply(ctx, { mcpUrl: 'https://example.test/mcp', port: 53007, autoTrigger: false } as any)
+  const { agent } = fakeAgent()
+  const messages = [userMessage('m1', '看一下notion中今天的待办有哪些')]
+  let entered = false
+
+  await emit('agent/pre-step', { agent, messages, signal: { throwIfAborted() {} } },
+    async () => { entered = true; return { kind: 'enter', messages } })
+
+  expect(entered).toBe(true)
+})
+
+it('passes the step through when the agent has no Notion authorization', async () => {
+  const { ctx, emit } = fakeCtx()
+  apply(ctx, { mcpUrl: 'https://example.test/mcp', port: 53007 })
+  const { agent } = fakeAgent()
+  const messages = [userMessage('m1', '看一下notion中今天的待办有哪些')]
+  let entered = false
+
+  // Failing to connect must not swallow the user's message.
+  await emit('agent/pre-step', { agent, messages, signal: { throwIfAborted() {} } },
+    async () => { entered = true; return { kind: 'enter', messages } })
+
+  expect(entered).toBe(true)
 })

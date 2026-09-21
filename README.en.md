@@ -8,19 +8,23 @@ Connect [DeepSeek Harness](https://github.com/deepseek-ai/dsh) (`dsh`) to [Notio
 
 ## What it does for you
 
-Once installed, your `dsh` agent can read and write Notion directly. You authorize once in your browser, then **connect on demand with `/notion` in the conversations that need it**: the plugin runs the full OAuth 2.0 (authorization code + PKCE) flow, stores the tokens securely in dsh's credential seam, keeps them refreshed for the life of the session, and mounts Notion's search, page, database, and comment tools under `mcp__notion__*`.
+Once installed, your `dsh` agent can read and write Notion directly. You authorize once in your browser, then **just talk normally** — mention that you want to work with Notion and the plugin connects, reclaiming the mount with the session when you are done. It runs the full OAuth 2.0 (authorization code + PKCE) flow, stores the tokens securely in dsh's credential seam, keeps them refreshed for the life of the session, and mounts Notion's search, page, database, and comment tools under `mcp__notion__*`.
 
 ## How this differs from an always-on mount
 
-The tools do **not** appear in every conversation. Only a conversation that has run `/notion` mounts them, and the mount is scoped to that conversation's own agent scope:
+The full Notion tools never appear out of nowhere, and never sit in context permanently:
 
-- A new conversation — or any conversation that never ran `/notion` — sees **no** `mcp__notion__*` tools at all, so their descriptions never consume context there.
-- The mount is reclaimed with the agent scope: when the conversation ends (or the agent is disposed) the connection and its tools go away with it.
-- Connecting on demand removes the standing cost of "install once, pay the tool-definition tokens in every turn forever".
+- **A new conversation, or one that never mentions Notion**: context carries only a tiny `notion_connect` bootstrap tool (a few dozen tokens) instead of ~40 full schemas.
+- **When you mention working with Notion**: the plugin mounts the full tools, scoped to that conversation's own agent scope.
+- **The mount is reclaimed with the agent scope**: when the conversation ends (or the agent is disposed) the connection and its tools go away with it.
+
+That keeps "say one sentence and it works" while removing the standing cost of "install once, pay the tool-definition tokens in every turn forever".
 
 ## Features
 
-- **On-demand mounting** — only conversations that ran `/notion` connect to Notion; every other conversation has zero tool injection.
+- **Keyword auto-connect** — a message that names Notion *and* carries an action intent (read / search / write / record / to-do / doc …) mounts automatically.
+- **Model bootstrap** — when the keyword rule does not fire, the model can call the always-present `notion_connect` tool itself.
+- **Explicit escape hatch** — the `/notion` command is always available to force a connection or dispatch a task.
 - **Per-conversation isolation** — tools live in the agent's own scope and never leak into other conversations.
 - **Zero-config OAuth** — dynamic client registration (RFC 7591) registers a client at runtime; no `client_id` or secret to copy.
 - **One-time browser login** — `dsh notion login` prints an authorization URL and waits for the callback on `127.0.0.1:53007`.
@@ -30,19 +34,52 @@ The tools do **not** appear in every conversation. Only a conversation that has 
 
 ## Usage
 
-In any conversation:
+**Just talk** — mentioning that you want to work with Notion connects automatically:
+
+```text
+What are my to-dos in notion today?
+Analyze the current architecture and record it in notion
+Sync these review notes to Notion
+```
+
+For precise control, use the explicit command:
 
 ```text
 /notion Summarize the "Architecture Design" doc in Notion
-```
-
-The plugin first mounts the Notion tools for the current conversation, **waits until they are actually registered**, and only then hands the task to the model — so the model can use `mcp__notion__*` in that very turn.
-
-```text
 /notion         # connect only, dispatch no task (keep chatting afterwards)
 ```
 
-The first task waits for the MCP connection and tool registration to settle, avoiding the race where the request is sent before the tools exist.
+### Keyword rule
+
+The trigger requires Notion **and** an action intent, so messages that merely *discuss* Notion do not fire:
+
+```text
+What is the difference between notion and Feishu?   ← no action intent
+What are my to-dos today?                           ← does not name Notion
+Don't use notion, write it locally                  ← explicit opt-out
+```
+
+If you want Notion but phrase it without an action word, the model can still call `notion_connect` itself.
+
+### Why it works in the same turn
+
+The crucial detail: **the tool list is finalized before the model request is built.** So the plugin cannot simply mount on a keyword match — the tools would only land on the next step, and the model would first answer "I cannot access Notion".
+
+Two paths avoid that trap:
+
+1. **Keyword hit** → mount inside the `agent/pre-step` hook, then re-queue the message and `reject` the step. A `reject` builds no model request (no tokens spent); the re-queued message is re-assembled on the next step with the new tools in place.
+2. **Keyword miss** → the model calls `notion_connect`, which returns only after the tools are truly registered, so the model's **very next step** sees them.
+
+Either way, the first time the model actually reaches for a Notion tool, the tool is guaranteed to be there.
+
+## Configuration
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `mcpUrl` | `https://mcp.notion.com/mcp` | Notion MCP server URL |
+| `port` | `53007` | Local OAuth callback port (`127.0.0.1`) |
+| `autoTrigger` | `true` | Auto-mount on a keyword match; set `false` to keep only `/notion` and `notion_connect` |
+| `connectTool` | `true` | Register the always-present `notion_connect` tool; set `false` for zero standing injection |
 
 
 ## Screenshots
@@ -68,15 +105,15 @@ browser approves → callback on 127.0.0.1:53007
    ▼
 tokens persisted (no automatic mount from here on)
    ⋯
-/notion <task> in some conversation
+a conversation mentions working with Notion (or sends /notion)
    │  5. Load the token, refreshing it if near expiry
    │  6. Mount the MCP client under that agent's scope and await registration
-   │  7. Deliver the task as a fresh turn for the model
+   │  7. Re-assemble this step's request, now with the tools in place
    ▼
 Notion tools available as mcp__notion__* for that conversation only
 ```
 
-`dsh notion login` only authorizes and persists the token — it does **not** mount a connection. The connection happens when a conversation runs `/notion`, mounted under that agent's own scope (`agent.ctx`), which is exactly why the tools never leak into other conversations. Near expiry the token is refreshed silently inside the session, serialized so a rotated refresh token is never replayed concurrently.
+`dsh notion login` only authorizes and persists the token — it does **not** mount a connection. The connection happens when a conversation needs Notion (keyword auto-connect, model bootstrap, or the explicit `/notion` command), mounted under that agent's own scope (`agent.ctx`), which is exactly why the tools never leak into other conversations. Near expiry the token is refreshed silently inside the session, serialized so a rotated refresh token is never replayed concurrently.
 
 ## Install
 
@@ -97,20 +134,13 @@ dsh --profile notion notion login
 
 The command registers a dynamic OAuth client, starts a temporary local HTTP server on `127.0.0.1:53007`, and prints an authorization URL. Open it in your browser and approve the request; Notion redirects to `http://127.0.0.1:53007/callback`, and the plugin validates the `state`, exchanges the code (plus the PKCE verifier) for tokens, and stores them.
 
-Authorization does **not** mount anything immediately. Run `/notion` (or `/notion <task>`) in a conversation to make the Notion tools available under `mcp__notion__*` for that conversation.
+Authorization does **not** mount anything immediately. Afterwards, mention that you want to work with Notion in a conversation (or send `/notion` directly) to make the tools available under `mcp__notion__*` for that conversation.
 
 ## Uninstall
 
 ```sh
 dsh plugin --profile web remove dsh-notion-mcp
 ```
-
-## Configuration
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `mcpUrl` | `https://mcp.notion.com/mcp` | Notion MCP server URL |
-| `port` | `53007` | Local OAuth callback port (`127.0.0.1`) |
 
 ## Security
 

@@ -4,12 +4,15 @@ import { Command } from 'commander'
 import { parseCmdline } from '@deepseek-ai/dsh-cmdline'
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 // 类型位置引入以激活 `dsh-commands` 对 cordis `Context` 的 `commands` 服务增强；
 // 该增强是模块声明合并，仅引类型即可生效，运行时不产生额外依赖。
 import '@deepseek-ai/dsh-commands'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { NotionTokenStore, type NotionTokens } from './notion-token-store.js'
+import { messageText, shouldTriggerNotion, isTriggerableMessage } from './notion-trigger.js'
 import {
   discoverOAuth,
   registerClient,
@@ -29,9 +32,19 @@ export const inject = ['cmdlineArgs', 'credentials']
 export const Config = z.object({
   mcpUrl: z.string().default('https://mcp.notion.com/mcp'),
   port: z.number().default(53007),
+  /**
+   * Mount automatically when a message names Notion with an action intent.
+   * Disable to require the explicit `/notion` command or the `notion_connect` tool.
+   */
+  autoTrigger: z.boolean().default(true),
+  /**
+   * Keep the tiny `notion_connect` bootstrap tool registered. It lets the model
+   * connect Notion itself when the keyword rule does not fire.
+   */
+  connectTool: z.boolean().default(true),
 })
 
-type Cfg = { mcpUrl: string; port: number }
+type Cfg = { mcpUrl: string; port: number; autoTrigger: boolean; connectTool: boolean }
 
 /**
  * One lazily-mounted, agent-scoped MCP connection.
@@ -47,18 +60,48 @@ interface AgentMount {
   pending?: PromiseLike<Fiber>
   refreshTimer?: ReturnType<typeof setTimeout>
   refreshMutex: { running: boolean }
+  /**
+   * Set while a pre-step auto-connect owns the mount, so a rejected and
+   * re-queued message does not try to mount a second time on its way back.
+   */
+  autoConnecting?: boolean
 }
 
-/** Live mounts keyed by agent session id. Entries are removed on agent disposal. */
-const mounts = new Map<string, AgentMount>()
+/**
+ * The always-registered bootstrap tool.
+ *
+ * A keyword match alone cannot make tools visible in the same step: the agent
+ * loop assembles the tool list *before* it dispatches `agent/pre-step`, so a
+ * mount performed inside that hook only lands in the NEXT step. This tiny tool
+ * closes that gap deterministically — the model calls it, the call returns
+ * after the real tools are registered, and the following step sees them.
+ *
+ * It costs a few dozen tokens instead of the ~40 full Notion schemas, which is
+ * the entire point of connecting on demand.
+ */
+const CONNECT_TOOL = 'notion_connect'
 
-function mountFor(agent: Agent): AgentMount {
+/**
+ * Mount state for one plugin instance, keyed by agent session id.
+ *
+ * Deliberately instance-scoped rather than module-level: a module-global map
+ * would survive plugin reloads and leak stale mount state into a fresh
+ * instance, silently suppressing the trigger for every agent it remembered.
+ */
+type MountRegistry = Map<string, AgentMount>
+
+function mountFor(mounts: MountRegistry, agent: Agent): AgentMount {
   let mount = mounts.get(agent.id)
   if (!mount) {
     mount = { refreshMutex: { running: false } }
     mounts.set(agent.id, mount)
   }
   return mount
+}
+
+/** The existing mount for this agent, if any — never creates one. */
+function existingMount(mounts: MountRegistry, agent: Agent): AgentMount | undefined {
+  return mounts.get(agent.id)
 }
 
 async function unmount(mount: AgentMount): Promise<void> {
@@ -82,6 +125,10 @@ async function unmount(mount: AgentMount): Promise<void> {
  * before this settles would race the request against tool registration and lose.
  */
 async function mountMcp(agentCtx: Context, accessToken: string, config: Cfg, mount: AgentMount): Promise<void> {
+  // 已挂载则直接复用：mcp-client 对同一作用域内重复的 serverName 会抛错，
+  // 因此这里必须拦住第二次挂载（重复 /notion、已连接后调用 notion_connect 等）。
+  // refreshAndRemount 会先 unmount（其内部清空 child）再调用本函数，故不受影响。
+  if (mount.child) return
   if (mount.pending) {
     await mount.pending
     return
@@ -253,6 +300,7 @@ async function runLogin(ctx: Context, store: NotionTokenStore, config: Cfg): Pro
 export function apply(ctx: Context, config: Cfg): void {
   const store = new NotionTokenStore(ctx.credentials)
   const isNotionCommand = (ctx.cmdlineArgs?.get() ?? [])[0] === 'notion'
+  const mounts: MountRegistry = new Map()
 
   // 不再在启动时自动挂载：没有 token 时不提示、有 token 时也不连接。
   // 工具只在一个会话真正执行 /notion 后，挂到该 agent 自己的作用域里生效。
@@ -264,7 +312,7 @@ export function apply(ctx: Context, config: Cfg): void {
       description: 'Mount Notion MCP tools for this conversation and run a task against them',
       input: { hint: '[task]' },
       handler: async ({ agent, rawInput }: CommandInvocation) => {
-        const mount = mountFor(agent)
+        const mount = mountFor(mounts, agent)
         const task = rawInput.trim()
 
         const result = await connect(agent, store, config, mount)
@@ -285,6 +333,82 @@ export function apply(ctx: Context, config: Cfg): void {
     })
   })
 
+  // 常驻微型工具（方案 B）：模型只需调用它即可让完整 Notion 工具在下一步可用。
+  // 这是关键字之外的自举路径，保证任何表述下都能连上，且不依赖网络先于请求。
+  if (config.connectTool !== false) ctx.inject(['tools'], (toolCtx) => {
+    toolCtx.tools.register(defineTool({
+      name: CONNECT_TOOL,
+      description:
+        'Connect the Notion tools for this conversation. Call this FIRST when the user wants to '
+        + 'read from or write to Notion (pages, databases, comments, to-dos); the full mcp__notion__* '
+        + 'tools become available on your next step. Do not call it for questions merely about Notion.',
+      parameters: {},
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { connected: { type: 'boolean', required: true } },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.connected
+            ? 'Notion tools are connected. Call the mcp__notion__* tools now to continue the task.'
+            : 'Notion could not be connected; report the failure to the user instead of retrying blindly.',
+        }],
+      },
+      execute: async (_args, exec) => {
+        const agent = exec.agent
+        if (agent === undefined) throw new Error(`${CONNECT_TOOL} requires a calling agent`)
+        const mount = mountFor(mounts, agent)
+        const result = await connect(agent, store, config, mount)
+        if (!result.ok) throw new Error(result.text)
+        return { connected: true }
+      },
+    }))
+  })
+
+  // 关键字自动挂载（方案 A）。pre-step 是消息进入模型前的最后一道 waterfall，
+  // 但工具清单在其之前就已 assemble，因此挂载必须靠「reject + 重排该消息」来生效：
+  // reject 不产生模型请求，消息重新入队后下一步会带着新工具重新组装。
+  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<PreStepDecision> => {
+    // 缺省视为开启：直接调用 apply() 的宿主（含测试）不会经过 schema 默认值填充。
+    if (config.autoTrigger === false) return next()
+    const mount = existingMount(mounts, agent)
+    if (mount?.child || mount?.autoConnecting) return next()
+
+    const trigger = messages.find(
+      (message: UserMessage) => isTriggerableMessage(message) && shouldTriggerNotion(messageText(message)),
+    )
+    if (trigger === undefined) return next()
+
+    // 消费掉这轮触发，避免重排回来的同一条消息再次触发（形成 reject 死循环）。
+    const active = mountFor(mounts, agent)
+    active.autoConnecting = true
+    try {
+      const result = await connect(agent, store, config, active)
+      if (!result.ok) {
+        // 连不上时不要吞掉用户消息：放行本次 step，让模型按普通对话处理并如实说明。
+        console.error(`[dsh-notion-mcp] auto-connect failed: ${result.text}`)
+        return next()
+      }
+    } catch (e) {
+      console.error(e)
+      return next()
+    } finally {
+      active.autoConnecting = false
+    }
+
+    signal.throwIfAborted()
+    // 把这批已被 claim 的消息按原顺序放回 next-step。reject 语义规定被 claim 的消息
+    // 「既不落库也不再重发」，因此不重排就会整批丢失。逆序遍历配合 prepend 才能保序。
+    for (const message of [...messages].reverse()) {
+      if (agent.inbox.nextStep.some((c) => c.id === message.id)) continue
+      if (agent.inbox.nextTurn.some((c) => c.id === message.id)) continue
+      agent.inbox.prepend('next-step', message)
+    }
+    return { kind: 'reject' }
+  })
+
   // 登录命令：只有当本次调用就是 `dsh ... notion ...` 时才接管命令行解析；否则（如
   // `dsh web`）命令行归 app（web/headless）所有。
   if (isNotionCommand) {
@@ -300,6 +424,15 @@ export function apply(ctx: Context, config: Cfg): void {
       })
     parseCmdline(ctx, program)
   }
+
+  // agent 销毁时释放挂载状态；工具本身随 agent 作用域自动回收，这里只清理映射，
+  // 否则长进程里 mounts 会随会话数无限增长。
+  ctx.on('agent/disposed', ({ agent }) => {
+    const mount = mounts.get(agent.id)
+    if (mount === undefined) return
+    mounts.delete(agent.id)
+    void unmount(mount)
+  })
 
   // cordis 4.0.1 用 `ctx.effect(() => disposer)` 做清理，不是 `ctx.on('dispose')`。
   // 这里兜住插件自身卸载时仍存活的挂载；正常路径下随 agent 作用域一起回收。
